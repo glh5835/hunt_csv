@@ -15,10 +15,41 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote, urldefrag, urljoin, urlparse
 
+import requests
+
 LOG_FILE = "app.log"
+
+logger = logging.getLogger(__name__)
 
 # Windows / Linux 文件名非法字符（含控制字符）
 _ILLEGAL_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def request_with_direct_fallback(session: requests.Session, method: str,
+                                 url: str, **kwargs) -> requests.Response:
+    """带"代理故障自动直连"的请求封装。
+
+    先按 session 默认方式请求（可能走系统代理）；出现以下本机代理链路
+    故障时，改用忽略代理的直连会话重试一次：
+    - ProxyError：系统代理本身不可达（代理软件已关闭但注册表配置残留）；
+    - SSLError：经代理的 TLS 握手被阻断（代理出口屏蔽目标站点）。
+    直连会话复制原会话的 headers。
+
+    其余异常（超时 / 直连也不可达等）原样抛出，由调用方的重试逻辑处理。
+    注意：这只是本机网络链路的自动降级，不改变任何访问权限——
+    资源本身仍必须是公开可访问的。
+    """
+    try:
+        return session.request(method, url, **kwargs)
+    except (requests.exceptions.ProxyError, requests.exceptions.SSLError):
+        logger.debug("经代理请求 %s 失败（代理不可达或 TLS 被阻断），尝试直连……", url)
+        direct = requests.Session()
+        try:
+            direct.headers.update(getattr(session, "headers", {}))
+        except Exception:
+            pass
+        direct.trust_env = False  # 忽略环境变量与注册表系统代理
+        return direct.request(method, url, **kwargs)
 
 
 def setup_logging() -> None:

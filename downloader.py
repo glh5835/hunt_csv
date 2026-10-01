@@ -23,7 +23,8 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from utils import filename_from_url, sanitize_filename, unique_filepath
+from utils import (filename_from_url, request_with_direct_fallback,
+                   sanitize_filename, unique_filepath)
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,10 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
                 req_headers["Range"] = f"bytes={offset}-"
 
         try:
-            resp = requests.get(candidate.url, stream=True, timeout=timeout,
-                                headers=req_headers)
+            # 经代理发生 SSL 握手失败时会自动改直连重试一次（见 utils）
+            resp = request_with_direct_fallback(
+                requests.Session(), "GET", candidate.url,
+                stream=True, timeout=timeout, headers=req_headers)
         except requests.exceptions.SSLError:
             last_error = "SSL 错误（证书校验失败）"
             logger.warning("下载 %s 第 %d/%d 次失败：SSL 错误", candidate.url, attempt, max_retries)

@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 from config import ensure_download_dir, load_config
 from downloader import preview_file
-from utils import setup_logging
+from utils import request_with_direct_fallback, setup_logging
 
 import logging
 
@@ -115,12 +115,28 @@ class KaggleDownloader:
     # ------------------------------------------------------------ 下载核心
 
     def _open_request(self, url: str, offset: int):
-        """发起（可续传的）下载请求。返回 Response 或 None（由调用方重试）。"""
+        """发起（可续传的）下载请求。
+
+        返回 Response（200/206）；或 ("DENIED", code) / ("NOT_FOUND", 404)
+        / None（其他失败，由调用方重试）。网络异常直接抛给调用方处理。
+        经代理发生 SSL 握手失败时会自动改直连重试一次（见 utils）。
+        """
         headers = {}
         if offset > 0:
             headers["Range"] = f"bytes={offset}-"
-        resp = self.session.get(url, stream=True, timeout=self.timeout,
-                                allow_redirects=True, headers=headers)
+        resp = request_with_direct_fallback(
+            self.session, "GET", url, stream=True, timeout=self.timeout,
+            allow_redirects=True, headers=headers)
+        # 私有/需授权数据集：明确提示，不绕过
+        if resp.status_code in (401, 403):
+            return ("DENIED", resp.status_code)
+        if resp.status_code == 404:
+            return ("NOT_FOUND", 404)
+        if resp.status_code not in (200, 206):
+            logger.warning("下载请求返回 HTTP %s", resp.status_code)
+            resp.close()
+            return None
+        return resp
         # 私有/需授权数据集：明确提示，不绕过
         if resp.status_code in (401, 403):
             return ("DENIED", resp.status_code)

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -32,9 +33,15 @@ import requests
 from bs4 import BeautifulSoup
 
 from utils import (filename_from_url, get_domain, is_valid_url, keyword_match,
-                   normalize_url, sanitize_filename)
+                   normalize_url, request_with_direct_fallback, sanitize_filename)
 
 logger = logging.getLogger(__name__)
+
+# 从页面脚本/内嵌 JSON 中嗅探数据接口端点的模式：
+# 引号包围的（相对或绝对）路径，形如 "national-data/download"、"/api/export"
+# （Laravel Ziggy 路由清单等 SPA 框架的典型形态，斜杠可有可无）
+API_ENDPOINT_RE = re.compile(
+    r'["\']((?:https?://[^"\']+)?/?[A-Za-z0-9_.\-]{2,40}/(?:download|export)s?)["\']')
 
 # 目标文件扩展名 -> 展示类型
 FILE_EXTS = {".csv": "CSV", ".xls": "Excel", ".xlsx": "Excel"}
@@ -100,8 +107,9 @@ class RobotsChecker:
         robots_url = f"{scheme_host}/robots.txt"
         result = (None, "allow")
         try:
-            resp = requests.get(robots_url, timeout=self.timeout,
-                                headers={"User-Agent": self.fetch_user_agent})
+            resp = request_with_direct_fallback(
+                requests.Session(), "GET", robots_url,
+                timeout=self.timeout, headers={"User-Agent": self.fetch_user_agent})
             code = resp.status_code
             if code == 200:
                 rp = robotparser.RobotFileParser()
@@ -174,8 +182,10 @@ class Crawler:
         for attempt in range(1, self.max_retries + 1):
             self._sleep()
             try:
-                resp = self.session.request(method, url, timeout=self.timeout,
-                                            allow_redirects=True, **kwargs)
+                # 经代理发生 SSL 握手失败时会自动改直连重试一次（见 utils）
+                resp = request_with_direct_fallback(
+                    self.session, method, url, timeout=self.timeout,
+                    allow_redirects=True, **kwargs)
                 # 401/403 直接返回给上层跳过：本工具不做任何绕过尝试
                 return resp
             except requests.exceptions.SSLError as e:
@@ -225,7 +235,7 @@ class Crawler:
     # ------------------------------------------------------------ HTML 解析
 
     def _parse_page(self, html: str, base_url: str):
-        """解析 HTML，返回 (soup, 页面标题, [(绝对链接, 链接文本), ...])。"""
+        """解析 HTML，返回 (soup, 页面标题, [(绝对链接, 链接文本), ...], iframe地址列表)。"""
         try:
             soup = BeautifulSoup(html, "lxml")
         except Exception:
@@ -246,7 +256,18 @@ class Crawler:
                 continue
             text = " ".join(tag.get_text().split())  # 压平空白
             links.append((absolute, text))
-        return soup, title, links
+
+        # <iframe> 是页面的组成部分（浏览器访问页面时同样会加载），
+        # 其内容也纳入爬取范围（仍受 robots / 深度限制约束）
+        iframes: list[str] = []
+        for tag in soup.find_all("iframe", src=True):
+            src = (tag.get("src") or "").strip()
+            if not src or src.lower().startswith(("javascript:", "data:")):
+                continue
+            absolute = normalize_url(base_url, src)
+            if absolute and is_valid_url(absolute):
+                iframes.append(absolute)
+        return soup, title, links, iframes
 
     # ------------------------------------------------------------ 页面数据提取
 
@@ -352,7 +373,7 @@ class Crawler:
     # ------------------------------------------------------------ HEAD 检测
 
     def _head_collect(self, url: str, text: str, title: str, source: str,
-                      candidates: dict[str, Candidate]) -> None:
+                      candidates: dict) -> None:
         """对扩展名无法判断但文本暗示是下载链接的 URL 发起 HEAD 请求，
         若 Content-Type 是 CSV/Excel 则纳入候选。"""
         if url in candidates:
@@ -362,17 +383,68 @@ class Crawler:
             logger.debug("HEAD 检测跳过（robots 限制）：%s", url)
             return
         resp = self._request("HEAD", url)
+        if resp is not None and resp.status_code in (405, 501):
+            # 服务器不支持 HEAD：改用流式 GET 只取响应头即关闭（不拉取正文）
+            resp.close()
+            resp = self._request("GET", url, stream=True)
+            if resp is not None:
+                ctype = resp.headers.get("Content-Type", "")
+                resp.close()
+                self._collect_if_spreadsheet(url, ctype, text, title, source, candidates)
+                return
         if resp is None:
             return
         if resp.status_code >= 400:
             logger.debug("HEAD %s 返回 %d，跳过", url, resp.status_code)
             return
-        kind = self._mime_kind(resp.headers.get("Content-Type", ""))
-        if kind:
-            logger.info("HEAD Content-Type 命中 %s：%s", kind, url)
-            candidates[url] = Candidate(url=url, filename=filename_from_url(url),
-                                        kind=kind, link_text=text, page_title=title,
-                                        source_page=source)
+        self._collect_if_spreadsheet(url, resp.headers.get("Content-Type", ""),
+                                     text, title, source, candidates)
+
+    def _collect_if_spreadsheet(self, url: str, content_type: str, text: str,
+                                title: str, source: str, candidates: dict) -> None:
+        """Content-Type 是 CSV/Excel 时把 URL 纳入候选。"""
+        kind = self._mime_kind(content_type)
+        if not kind:
+            return
+        logger.info("Content-Type 命中 %s：%s", kind, url)
+        filename = filename_from_url(url)
+        if "." not in filename.rsplit("/", 1)[-1]:  # 无扩展名时按类型补
+            filename += ".csv" if kind == "CSV" else ".xlsx"
+        candidates[url] = Candidate(url=url, filename=filename, kind=kind,
+                                    link_text=text, page_title=title,
+                                    source_page=source)
+
+    def _extract_api_endpoints(self, html: str, page_url: str, title: str,
+                               candidates: dict) -> None:
+        """从页面脚本/内嵌 JSON 中嗅探数据下载端点（SPA 数据站的常见形态）。
+
+        页面可见的数据表格常由 JS 从 /xxx/download 这类接口异步加载，
+        静态 HTML 里没有对应 <a> 链接。这里扫描页面文本中引号包围的
+        端点路径，转绝对 URL 后用（HEAD 或流式 GET 的）响应头验证
+        Content-Type 是否为 CSV/Excel，命中则纳入候选。
+        """
+        found = 0
+        seen: set[str] = set()
+        normalized_html = html.replace("\\/", "/")  # JS 字符串里的转义斜杠
+        # 路由型路径按"根相对"拼接（相对当前页面路径解析会错位）
+        p = urlparse(page_url)
+        root_base = f"{p.scheme}://{p.netloc}/"
+        for m in API_ENDPOINT_RE.finditer(normalized_html):
+            if found >= 5:
+                break
+            path = m.group(1)
+            if path.startswith("http"):
+                absolute = normalize_url(page_url, path)
+            else:
+                absolute = normalize_url(root_base, "/" + path.lstrip("/"))
+            if absolute in seen or not is_valid_url(absolute) or absolute in candidates:
+                continue
+            seen.add(absolute)
+            logger.info("嗅探到疑似数据端点：%s（来源页面 %s）", absolute, page_url)
+            self._head_collect(absolute, "数据下载端点", title, page_url, candidates)
+            if absolute in candidates:
+                found += 1
+                print(f"    [发现] 接口 {candidates[absolute].kind}: {absolute}")
 
     # ------------------------------------------------------------ 主流程
 
@@ -426,13 +498,26 @@ class Crawler:
                 continue
 
             # 4) 解析页面链接与内嵌数据表
-            soup, title, links = self._parse_page(resp.text, url)
-            logger.info("解析页面 %s：title=%r，提取链接 %d 个", url, title, len(links))
+            soup, title, links, iframes = self._parse_page(resp.text, url)
+            logger.info("解析页面 %s：title=%r，链接 %d 个，iframe %d 个",
+                        url, title, len(links), len(iframes))
             next_depth = depth + 1
 
             # 4a) 提取页面中的 HTML 表格 / 纯文本 CSV 数据（"文本形式"的表格数据）
             self._extract_tables(soup, url, title, candidates)
             self._extract_text_csv(soup, url, title, candidates)
+
+            # 4b) 嗅探页面脚本/内嵌 JSON 中的数据下载端点（SPA 数据站）
+            self._extract_api_endpoints(resp.text, url, title, candidates)
+
+            # 4c) iframe 是页面组成部分：纳入爬取（受 robots / 深度 / 去重约束；
+            #     跨域 iframe 会提示日志，不适用 same_domain 的 <a> 链接限制）
+            for frame_url in iframes:
+                if next_depth <= self.max_depth and frame_url not in enqueued:
+                    if get_domain(frame_url) != start_domain:
+                        logger.info("跟进跨域 iframe：%s（页面组成部分）", frame_url)
+                    enqueued.add(frame_url)
+                    queue.append((frame_url, next_depth))
 
             for link, text in links:
                 if not is_valid_url(link):
