@@ -1,0 +1,9 @@
+{
+  "download_dir": "./downloads",
+  "max_depth": 2,
+  "same_domain": true,
+  "delay": 1.0,
+  "timeout": 10,
+  "max_retries": 3,
+  "user_agent": "Mozilla/5.0 (compatible; WebCSVExcelCollector/1.0)"
+}
