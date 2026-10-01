@@ -19,6 +19,9 @@
   `<pre>/<code>/<textarea>` 中的 CSV/TSV 纯文本，与文件链接一起列为候选，
   选择下载时直接导出为本地 CSV（UTF-8 with BOM，Excel 打开中文不乱码）；
 - 关键词过滤：匹配 URL / 文件名 / 链接文本 / 页面标题 / 表格列名，不区分大小写，多个关键词空格分隔、任一命中即可；
+- **Kaggle 公开数据集免登录下载**：`--kaggle` 模式走 Kaggle 官方公开端点
+  （无需账号），支持 **HTTP Range 断点续传**——国内访问断联后重新运行即可
+  从断点继续，不必重头下载；下载的 zip 自动解压并预览其中的 CSV/Excel；
 - 交互式下载：`y` 全部下载、`n` 放弃、`d` 修改目录、`1` 或 `1,3` 下载指定序号、`q` 退出；
 - 流式下载 + tqdm 进度条 + 失败重试 + 重名自动加序号（`name_1.csv`）；
 - 下载后可用 pandas 预览前 5 行、行列数、列名（预览失败不影响文件）；
@@ -29,14 +32,15 @@
 
 ```
 WebCSVExcelCollector/
-├── main.py          # 程序入口：命令行解析 + 交互流程
-├── config.py        # 配置读写（config.json 自动创建/保存）
-├── crawler.py       # 爬虫：robots 检查 + BFS + 链接解析 + 候选收集
-├── downloader.py    # 下载：流式下载 + 重试 + pandas 预览
-├── utils.py         # 工具：日志、URL 校验、文件名安全化、关键词匹配
-├── config.json      # 配置文件（首次运行自动生成）
-├── requirements.txt # 依赖清单
-└── README.md        # 本文件
+├── main.py              # 程序入口：命令行解析 + 交互流程
+├── config.py            # 配置读写（config.json 自动创建/保存）
+├── crawler.py           # 爬虫：robots 检查 + BFS + 链接解析 + 候选收集
+├── downloader.py        # 下载：流式下载 + 重试 + pandas 预览
+├── kaggle_downloader.py # Kaggle 公开数据集免登录下载（断点续传 + 自动解压）
+├── utils.py             # 工具：日志、URL 校验、文件名安全化、关键词匹配
+├── config.json          # 配置文件（首次运行自动生成）
+├── requirements.txt     # 依赖清单
+└── README.md            # 本文件
 ```
 
 ## 安装
@@ -69,6 +73,12 @@ python main.py --url https://example.com/data/
 python main.py --url https://example.com/data/ --keyword 销售 报表
 python main.py --url https://example.com/ --keyword sales --dir D:\mydata
 python main.py --no-preview          # 下载后不做 pandas 预览
+
+# Kaggle 公开数据集免登录下载（推荐国内用户使用，断联可续传）
+python main.py --kaggle https://www.kaggle.com/datasets/owner/dataset-slug
+python main.py --kaggle owner/dataset-slug
+python kaggle_downloader.py owner/dataset-slug          # 也可直接运行该模块
+# 交互模式下把 Kaggle 数据集页面 URL 当起始网址输入，会自动切换到该模式
 ```
 
 参数说明：
@@ -78,6 +88,7 @@ python main.py --no-preview          # 下载后不做 pandas 预览
 | `--url` | 起始网址；不提供则交互输入 |
 | `--keyword` | 检索关键词，空格分隔多个，可为空；不提供则交互输入 |
 | `--dir` | 下载目录，立即生效并保存到 config.json |
+| `--kaggle` | Kaggle 公开数据集免登录下载模式（URL 或 owner/slug） |
 | `--no-preview` | 下载后不使用 pandas 预览 |
 
 ## 配置（config.json）
@@ -178,13 +189,21 @@ $ python main.py
 浏览器执行 JavaScript 后从后端 API 动态加载的，静态 HTML 里既没有 `<table>` 也没有
 `.csv` 链接（实测 Kaggle 数据集页静态 HTML 仅约 13KB 且 0 个表格），因此无法提取。
 这是 requests 静态抓取的固有限制，本工具按合规原则不做浏览器模拟绕过。解决办法：
-- Kaggle 数据集：使用官方途径——登录网页下载，或官方 `kagglehub` 库
-  （`pip install kagglehub`，公开数据集可匿名下载：
-  `python -c "import kagglehub; print(kagglehub.dataset_download('作者/数据集名'))"`）；
+
+- **Kaggle 数据集（推荐）**：直接用本项目内置的免登录下载模式——
+  `python main.py --kaggle owner/dataset-slug`。它走 Kaggle 官方公开端点
+  `https://www.kaggle.com/api/v1/datasets/download/{owner}/{slug}`（官方文档明确
+  认证仅私有资源需要），无需登录，且支持断点续传，适合国内不稳定网络；
 - 其他站点：尝试找到数据的原始来源页（多为静态 HTML 或直接的文件下载地址）。
 - 提取页面表格功能适用于静态渲染表格的网站（维基百科、政府/统计机构公开数据页等）。
 
-**Q10：提取的"文本CSV"会误判吗？**
+**Q10：Kaggle 下载模式断联了怎么办？**
+下载进度保存在 `{文件}.zip.part` 与 `{文件}.zip.meta.json` 中，断联后程序会
+指数退避自动重试；若重试耗尽或你按了 Ctrl+C，**重新运行同一条命令即可从断点
+继续**，不会重头下载。若远端数据集更新过（ETag/大小变化），程序会自动改为
+重新下载完整文件。注意：私有数据集（401/403）会被拒绝并提示，本工具不做绕过。
+
+**Q11：提取的"文本CSV"会误判吗？**
 `<pre>` 里的代码块若恰好行结构规整（每行逗号数量一致）可能被误判为 CSV。
 判定条件已尽量保守（至少 2 行、分隔符数量行间稳定），且最终由你在候选清单中
 人工确认选择下载，可用关键词过滤减小干扰。

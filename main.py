@@ -25,6 +25,7 @@ from pathlib import Path
 from config import CONFIG_FILE, ensure_download_dir, load_config, save_config
 from crawler import Crawler, filter_by_keywords
 from downloader import download_batch
+from kaggle_downloader import KaggleDownloader, is_kaggle_dataset_url, parse_kaggle_handle
 from utils import is_valid_url, parse_keywords, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--url", help="起始网址 URL（不提供则运行时交互输入）")
     parser.add_argument("--keyword", help="检索关键词，多个用空格分隔，可为空")
     parser.add_argument("--dir", dest="download_dir", help="下载目录（会保存到 config.json）")
+    parser.add_argument("--kaggle",
+                        help="Kaggle 公开数据集下载模式：传入数据集页面 URL 或 owner/slug"
+                             "（官方公开端点，无需登录，支持断点续传）")
     parser.add_argument("--no-preview", action="store_true", help="下载后不使用 pandas 预览文件")
     return parser.parse_args(argv)
 
@@ -144,6 +148,16 @@ def prepare_download_dir(config: dict) -> Path | None:
         return None
 
 
+def run_kaggle_download(text: str, config: dict, preview: bool = True) -> int:
+    """Kaggle 公开数据集下载模式（无需登录，支持断点续传）。"""
+    handle = parse_kaggle_handle(text)
+    if not handle:
+        print(f"无法解析 Kaggle 数据集标识：{text}")
+        return 1
+    directory = ensure_download_dir(str(Path(config["download_dir"]) / "kaggle"))
+    return KaggleDownloader(config).run(handle, directory, preview=preview)
+
+
 def main(argv=None) -> int:
     # Windows 控制台避免中文乱码；行缓冲保证日志与输出顺序稳定
     try:
@@ -171,6 +185,14 @@ def main(argv=None) -> int:
     print(BANNER)
     show_config(config)
 
+    # ---- Kaggle 公开数据集下载模式（--kaggle 直接进入）----
+    if args.kaggle:
+        try:
+            return run_kaggle_download(args.kaggle, config, preview=not args.no_preview)
+        except KeyboardInterrupt:
+            print("\n检测到 Ctrl+C：下载进度已保存（.part 文件），再次运行可从断点继续。")
+            return 130
+
     # ---- 获取 URL 与关键词 ----
     url = args.url if args.url else ask_url()
     if not url:
@@ -179,6 +201,17 @@ def main(argv=None) -> int:
     if not is_valid_url(url):
         print(f"URL 格式错误：{url}\n需要以 http:// 或 https:// 开头的完整网址。")
         return 1
+
+    # Kaggle 数据集页面：数据由 JS 动态加载，静态爬取拿不到，自动切换官方下载模式
+    if is_kaggle_dataset_url(url):
+        print("\n检测到 Kaggle 数据集页面：该页面的数据表格由 JavaScript 动态加载，"
+              "静态爬取无法获取。\n已自动切换到 Kaggle 公开数据集下载模式"
+              "（官方公开端点，无需登录，支持断点续传）。\n")
+        try:
+            return run_kaggle_download(url, config, preview=not args.no_preview)
+        except KeyboardInterrupt:
+            print("\n检测到 Ctrl+C：下载进度已保存（.part 文件），再次运行可从断点继续。")
+            return 130
 
     keyword_raw = args.keyword if args.keyword is not None else ask_keyword()
     keywords = parse_keywords(keyword_raw)
