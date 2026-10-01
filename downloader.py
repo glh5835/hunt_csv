@@ -30,19 +30,35 @@ CHUNK_SIZE = 64 * 1024  # 流式读取块：64 KB
 # 按 kind 补默认扩展名（用于 Content-Type 命中但 URL 无扩展名的情况）
 DEFAULT_EXT_BY_KIND = {"CSV": ".csv", "Excel": ".xlsx"}
 
+# 响应 Content-Type -> 扩展名（URL 无扩展名时按响应类型补全文件名）
+MIME_EXT_MAP = {
+    "text/csv": ".csv",
+    "application/csv": ".csv",
+    "text/tab-separated-values": ".tsv",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+    "application/json": ".json",
+    "application/zip": ".zip",
+    "application/pdf": ".pdf",
+}
 
-def _build_target_path(directory: Path, candidate) -> Path:
-    """确定写入路径：安全化文件名 + 保留扩展名 + 重名自动加序号。"""
+
+def _build_target_path(directory: Path, candidate, resp: requests.Response | None = None) -> Path:
+    """确定写入路径：安全化文件名 + 补扩展名（URL 无后缀时按响应 Content-Type）+ 重名加序号。"""
     name = filename_from_url(candidate.url)
-    if not Path(name).suffix:  # 无扩展名时按类型补一个
-        name += DEFAULT_EXT_BY_KIND.get(candidate.kind, ".bin")
+    if not Path(name).suffix:
+        if resp is not None:
+            mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            name += MIME_EXT_MAP.get(mime, "")
+        if not Path(name).suffix:  # 仍无后缀（TABLE/TEXT 候选或未知类型）
+            name += DEFAULT_EXT_BY_KIND.get(getattr(candidate, "kind", ""), ".bin")
     return unique_filepath(directory, name)
 
 
-def _write_stream(resp: requests.Response, directory: Path, candidate) -> Path:
-    """把响应流式写入磁盘（带 tqdm 进度条），返回本地路径。"""
-    directory.mkdir(parents=True, exist_ok=True)
-    path = _build_target_path(directory, candidate)
+def _write_stream(resp: requests.Response, path: Path) -> Path:
+    """把响应流式写入指定路径（带 tqdm 进度条）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
     total = resp.headers.get("Content-Length")
     total = int(total) if total and total.isdigit() else None
 
@@ -90,6 +106,7 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
     delay = float(config.get("delay", 1.0))
     headers = {"User-Agent": config.get("user_agent", "WebCSVExcelCollector/1.0")}
 
+    target: Path | None = None  # 本轮重试共用的目标路径（重传时复用同名）
     last_error = ""
     for attempt in range(1, max_retries + 1):
         if delay > 0:
@@ -115,14 +132,29 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
 
         with resp:
             if resp.status_code == 200:
+                if target is None:
+                    target = _build_target_path(directory, candidate, resp)
                 try:
-                    path = _write_stream(resp, directory, candidate)
-                    return True, "成功", path
-                except (PermissionError, OSError) as e:
-                    # 文件写入权限错误：重试无意义，直接失败并提示
-                    last_error = f"文件写入失败（权限或磁盘问题）：{e}"
+                    _write_stream(resp, target)
+                    return True, "成功", target
+                except PermissionError as e:
+                    # 明确的写盘权限错误：重试无意义，直接失败并提示
+                    last_error = f"文件写入失败（权限问题）：{e}"
                     logger.error("写入 %s 失败：%s", candidate.url, e)
                     return False, last_error, None
+                except (requests.exceptions.RequestException,
+                        ConnectionError, OSError) as e:
+                    # 传输中断（连接重置 / SSL 提前结束 / 响应不完整等）：
+                    # 删除半截文件后重试（重新发起完整请求）
+                    last_error = f"传输中断：{e}"
+                    logger.warning("下载 %s 传输中断：%s（将重试）",
+                                   candidate.url, e.__class__.__name__)
+                    try:
+                        target.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    target = None
+                    continue
             elif 400 <= resp.status_code < 500 and resp.status_code != 429:
                 # 403/404 等客户端错误：不绕过、不重试，直接失败
                 last_error = f"HTTP {resp.status_code}（客户端错误，不重试）"

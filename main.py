@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ from config import CONFIG_FILE, ensure_download_dir, load_config, save_config
 from crawler import Crawler, filter_by_keywords
 from downloader import download_batch
 from kaggle_downloader import KaggleDownloader, is_kaggle_dataset_url, parse_kaggle_handle
-from utils import is_valid_url, parse_keywords, setup_logging
+from utils import filename_from_url, is_valid_url, parse_keywords, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--kaggle",
                         help="Kaggle 公开数据集下载模式：传入数据集页面 URL 或 owner/slug"
                              "（官方公开端点，无需登录，支持断点续传）")
+    parser.add_argument("--download-url", dest="download_url",
+                        help="直接下载模式：下载指定的公开文件/数据接口 URL（不再爬取页面）")
+    parser.add_argument("--no-proxy", action="store_true",
+                        help="绕过系统代理直连（代理阻断某些站点 TLS 时使用）")
     parser.add_argument("--no-preview", action="store_true", help="下载后不使用 pandas 预览文件")
     return parser.parse_args(argv)
 
@@ -184,6 +189,29 @@ def main(argv=None) -> int:
 
     print(BANNER)
     show_config(config)
+
+    # --no-proxy：绕过系统代理直连（Windows 下代理可能来自注册表，需 NO_PROXY=* 才彻底）
+    if args.no_proxy:
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                    "ALL_PROXY", "all_proxy"):
+            os.environ.pop(var, None)
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+        print("已启用 --no-proxy：忽略系统代理（含注册表代理），所有请求直连。\n")
+
+    # ---- 直接下载模式（--download-url）：不爬页面，直接流式下载指定 URL ----
+    if args.download_url:
+        from crawler import Candidate
+        if not is_valid_url(args.download_url):
+            print(f"URL 格式错误：{args.download_url}")
+            return 1
+        directory = prepare_download_dir(config)
+        if directory is None:
+            return 1
+        cand = Candidate(url=args.download_url,
+                         filename=filename_from_url(args.download_url), kind="FILE")
+        download_batch([cand], directory, config, preview=not args.no_preview)
+        return 0
 
     # ---- Kaggle 公开数据集下载模式（--kaggle 直接进入）----
     if args.kaggle:
