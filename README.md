@@ -15,7 +15,10 @@
 - BFS 爬取，`max_depth` 控制深度，`same_domain` 控制是否仅同域名；
 - robots.txt 检查（含保守策略：robots.txt 无法读取时视为禁止并警告）；
 - 双重文件识别：URL 扩展名匹配（`.csv/.xls/.xlsx`）或 HEAD 请求 Content-Type 匹配；
-- 关键词过滤：匹配 URL / 文件名 / 链接文本 / 页面标题，不区分大小写，多个关键词空格分隔、任一命中即可；
+- **页面表格提取**：识别并提取网页中"文本形式"的数据——HTML `<table>` 表格、
+  `<pre>/<code>/<textarea>` 中的 CSV/TSV 纯文本，与文件链接一起列为候选，
+  选择下载时直接导出为本地 CSV（UTF-8 with BOM，Excel 打开中文不乱码）；
+- 关键词过滤：匹配 URL / 文件名 / 链接文本 / 页面标题 / 表格列名，不区分大小写，多个关键词空格分隔、任一命中即可；
 - 交互式下载：`y` 全部下载、`n` 放弃、`d` 修改目录、`1` 或 `1,3` 下载指定序号、`q` 退出；
 - 流式下载 + tqdm 进度条 + 失败重试 + 重名自动加序号（`name_1.csv`）；
 - 下载后可用 pandas 预览前 5 行、行列数、列名（预览失败不影响文件）；
@@ -88,6 +91,9 @@ python main.py --no-preview          # 下载后不做 pandas 预览
 | `timeout` | `10` | 单次请求超时（秒） |
 | `max_retries` | `3` | 网络失败最大重试次数 |
 | `user_agent` | `Mozilla/5.0 (compatible; WebCSVExcelCollector/1.0)` | User-Agent |
+| `extract_tables` | `true` | 提取页面 HTML `<table>` 表格作为候选（导出为 CSV） |
+| `extract_text_csv` | `true` | 提取 `<pre>/<code>/<textarea>` 中 CSV/TSV 样式纯文本 |
+| `max_tables_per_page` | `10` | 每页最多提取的表格/文本块数量（防内存滥用） |
 
 - 首次运行自动生成默认配置；
 - 运行中输入 `d` 可修改下载目录并**立即保存**回 `config.json`。
@@ -120,10 +126,11 @@ $ python main.py
 
 爬取结束：共访问 2 个页面，收集到 2 个候选链接。
 
-爬取完成：共发现 2 个 CSV / Excel 链接。
-找到 2 个候选文件：
-1. sales_2023.csv | CSV | http://127.0.0.1:8000/data/sales_2023.csv
-2. sales_report.xlsx | Excel | http://127.0.0.1:8000/reports/sales_report.xlsx
+爬取完成：共发现 3 个候选（含文件链接与页面表格/文本数据）。
+找到 3 个候选：
+1. 2023年销售统计表_table1.csv | 表格（3行×3列，导出为CSV） | http://127.0.0.1:8000/stats.html
+2. 2023年销售统计表_text1.csv | 文本CSV（3行×3列，导出为CSV） | http://127.0.0.1:8000/stats.html
+3. sales_2023.csv | CSV | http://127.0.0.1:8000/data/sales_2023.csv
 当前下载目录：./downloads
 请选择：y=全部下载，n=不下载退出，d=修改下载目录，数字=下载指定序号，q=退出
 > y
@@ -165,6 +172,22 @@ $ python main.py
 
 **Q8：想爬慢一点/快一点？**
 修改 `config.json` 的 `delay`（秒）。**建议保持 >= 1.0**，这是合规的基本要求。
+
+**Q9：页面上明明看得到表格，为什么提取不到？（Kaggle 等 JS 渲染站点）**
+本工具只解析服务器返回的**静态 HTML**。Kaggle、各类单页应用（SPA）的数据表格是
+浏览器执行 JavaScript 后从后端 API 动态加载的，静态 HTML 里既没有 `<table>` 也没有
+`.csv` 链接（实测 Kaggle 数据集页静态 HTML 仅约 13KB 且 0 个表格），因此无法提取。
+这是 requests 静态抓取的固有限制，本工具按合规原则不做浏览器模拟绕过。解决办法：
+- Kaggle 数据集：使用官方途径——登录网页下载，或官方 `kagglehub` 库
+  （`pip install kagglehub`，公开数据集可匿名下载：
+  `python -c "import kagglehub; print(kagglehub.dataset_download('作者/数据集名'))"`）；
+- 其他站点：尝试找到数据的原始来源页（多为静态 HTML 或直接的文件下载地址）。
+- 提取页面表格功能适用于静态渲染表格的网站（维基百科、政府/统计机构公开数据页等）。
+
+**Q10：提取的"文本CSV"会误判吗？**
+`<pre>` 里的代码块若恰好行结构规整（每行逗号数量一致）可能被误判为 CSV。
+判定条件已尽量保守（至少 2 行、分隔符数量行间稳定），且最终由你在候选清单中
+人工确认选择下载，可用关键词过滤减小干扰。
 
 ## 本地测试建议
 

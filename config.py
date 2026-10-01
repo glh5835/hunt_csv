@@ -27,6 +27,10 @@ DEFAULT_CONFIG = {
     "timeout": 10,
     "max_retries": 3,
     "user_agent": "Mozilla/5.0 (compatible; WebCSVExcelCollector/1.0)",
+    # 新功能：提取页面中"文本形式"的数据表格
+    "extract_tables": True,       # 提取 HTML <table> 表格并可作为候选导出为 CSV
+    "extract_text_csv": True,     # 提取 <pre>/<code>/<textarea> 中 CSV/TSV 样式的纯文本
+    "max_tables_per_page": 10,    # 每个页面最多提取的表格数量（防内存滥用）
 }
 
 
@@ -55,6 +59,9 @@ def load_config() -> dict:
         config["timeout"] = int(config.get("timeout", 10))
         config["max_retries"] = int(config.get("max_retries", 3))
         config["same_domain"] = bool(config.get("same_domain", True))
+        config["extract_tables"] = bool(config.get("extract_tables", True))
+        config["extract_text_csv"] = bool(config.get("extract_text_csv", True))
+        config["max_tables_per_page"] = max(int(config.get("max_tables_per_page", 10)), 1)
         config["user_agent"] = str(config.get("user_agent", DEFAULT_CONFIG["user_agent"]))
     except (TypeError, ValueError) as e:
         logger.warning("config.json 中存在非法数值（%s），相关项已回退默认值。", e)

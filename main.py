@@ -87,10 +87,13 @@ def ask_keyword() -> str:
 
 
 def list_candidates(cands: list, download_dir: str) -> None:
-    """打印候选文件清单与操作提示。"""
-    print(f"\n找到 {len(cands)} 个候选文件：")
+    """打印候选清单（文件链接 + 页面表格/文本数据）与操作提示。"""
+    print(f"\n找到 {len(cands)} 个候选：")
     for i, c in enumerate(cands, 1):
-        print(f"{i}. {c.filename} | {c.kind} | {c.url}")
+        extra = ""
+        if getattr(c, "data_type", "FILE") != "FILE":
+            extra = f"（{c.rows}行×{c.cols}列，导出为CSV）"
+        print(f"{i}. {c.filename} | {c.kind}{extra} | {c.url}")
     print(f"当前下载目录：{download_dir}")
     print("请选择：y=全部下载，n=不下载退出，d=修改下载目录，数字=下载指定序号，q=退出")
 
@@ -196,7 +199,8 @@ def main(argv=None) -> int:
         return 130
 
     # ---- 关键词过滤 ----
-    print(f"\n爬取完成：共发现 {len(candidates)} 个 CSV / Excel 链接。")
+    print(f"\n爬取完成：共发现 {len(candidates)} 个候选"
+          f"（含文件链接与页面表格/文本数据）。")
     selected = filter_by_keywords(candidates, keywords)
     dropped = len(candidates) - len(selected)
     if dropped:

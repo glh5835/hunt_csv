@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""downloader.py —— 下载模块
+"""downloader.py —— 下载/导出模块
 
 职责：
-1. 流式下载候选文件（iter_content 分块写入，避免大文件占满内存）；
-2. tqdm 显示下载进度；
-3. 失败自动重试（最多 max_retries 次），4xx 客户端错误不重试；
-4. 文件名安全化并保留扩展名；重名自动改为 name_1.csv、name_2.csv……
-5. 下载后可选使用 pandas 预览（前 5 行 / 行数列数 / 列名）；预览失败不影响已下载文件。
+1. FILE 候选：流式下载远程文件（iter_content 分块写入，避免大文件占满内存）；
+2. TABLE / TEXT 候选（页面内嵌表格与文本数据）：直接把爬取阶段提取的
+   DataFrame 写入本地 CSV（utf-8-sig，Excel 打开中文不乱码），不再发网络请求；
+3. tqdm 显示下载进度；
+4. 失败自动重试（最多 max_retries 次），4xx 客户端错误不重试；
+5. 文件名安全化并保留扩展名；重名自动改为 name_1.csv、name_2.csv……
+6. 下载/导出后可选使用 pandas 预览（前 5 行 / 行数列数 / 列名）；
+   预览失败不影响已下载文件。
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from utils import filename_from_url, unique_filepath
+from utils import filename_from_url, sanitize_filename, unique_filepath
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +55,36 @@ def _write_stream(resp: requests.Response, directory: Path, candidate) -> Path:
     return path
 
 
-def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, Path | None]:
-    """下载单个文件。返回 (是否成功, 说明消息, 本地路径或 None)。
+def _export_payload(candidate, directory: Path) -> Path:
+    """把页面提取的表格/文本数据（DataFrame）写入本地 CSV。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    filename = sanitize_filename(candidate.filename) or "table.csv"
+    if not Path(filename).suffix:
+        filename += ".csv"
+    path = unique_filepath(directory, filename)
+    candidate.payload.to_csv(path, index=False, encoding="utf-8-sig")
+    return path
 
-    - 每次尝试前按 delay 限速；
-    - 网络错误 / 5xx / 429 自动重试，4xx（除 429）不重试；
-    - 文件写入权限错误直接失败并提示，不重试。
+
+def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, Path | None]:
+    """处理单个候选。返回 (是否成功, 说明消息, 本地路径或 None)。
+
+    - TABLE/TEXT 候选：直接导出已提取的 DataFrame，不发网络请求；
+    - FILE 候选：每次尝试前按 delay 限速；网络错误 / 5xx / 429 自动重试，
+      4xx（除 429）不重试；文件写入权限错误直接失败并提示，不重试。
     """
+    # ---- 页面表格/文本数据：直接导出 ----
+    if getattr(candidate, "data_type", "FILE") in ("TABLE", "TEXT") and candidate.payload is not None:
+        try:
+            path = _export_payload(candidate, directory)
+            label = "表格" if candidate.data_type == "TABLE" else "文本数据"
+            msg = f"成功（导出页面{label}，{candidate.rows} 行 × {candidate.cols} 列）"
+            return True, msg, path
+        except (PermissionError, OSError) as e:
+            msg = f"文件写入失败（权限或磁盘问题）：{e}"
+            logger.error("导出 %s 失败：%s", candidate.filename, e)
+            return False, msg, None
+
     timeout = int(config.get("timeout", 10))
     max_retries = int(config.get("max_retries", 3))
     delay = float(config.get("delay", 1.0))
@@ -140,7 +166,7 @@ def download_batch(candidates: list, directory: Path, config: dict,
     """
     results: list[tuple] = []
     total = len(candidates)
-    print(f"\n开始下载 {total} 个文件到：{directory.resolve()}\n")
+    print(f"\n开始下载/导出 {total} 个候选到：{directory.resolve()}\n")
 
     for i, cand in enumerate(candidates, 1):
         print(f"[{i}/{total}] {cand.url}")
