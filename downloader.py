@@ -2,7 +2,9 @@
 """downloader.py —— 下载/导出模块
 
 职责：
-1. FILE 候选：流式下载远程文件（iter_content 分块写入，避免大文件占满内存）；
+1. FILE 候选：流式下载远程文件（iter_content 分块写入，避免大文件占满内存），
+   支持 HTTP Range 断点续传——传输中断后自动从已下载字节处继续，
+   不稳定链路下大文件也不必从头重下；
 2. TABLE / TEXT 候选（页面内嵌表格与文本数据）：直接把爬取阶段提取的
    DataFrame 写入本地 CSV（utf-8-sig，Excel 打开中文不乱码），不再发网络请求；
 3. tqdm 显示下载进度；
@@ -56,19 +58,22 @@ def _build_target_path(directory: Path, candidate, resp: requests.Response | Non
     return unique_filepath(directory, name)
 
 
-def _write_stream(resp: requests.Response, path: Path) -> Path:
-    """把响应流式写入指定路径（带 tqdm 进度条）。"""
+def _write_stream(resp: requests.Response, path: Path, mode: str = "wb",
+                  offset: int = 0, total: int | None = None) -> None:
+    """把响应流式写入指定路径（带 tqdm 进度条，从 offset 起显示）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    total = resp.headers.get("Content-Length")
-    total = int(total) if total and total.isdigit() else None
-
-    with open(path, "wb") as f, tqdm(total=total, unit="B", unit_scale=True,
-                                     desc=f"  下载 {path.name}", leave=False) as bar:
+    with open(path, mode) as f, tqdm(total=total, initial=offset, unit="B",
+                                     unit_scale=True, desc=f"  下载 {path.name}",
+                                     leave=False) as bar:
         for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
             if chunk:
                 f.write(chunk)
                 bar.update(len(chunk))
-    return path
+
+
+def _part_of(path: Path) -> Path:
+    """断点续传的临时文件路径：name.csv -> name.csv.part"""
+    return path.with_name(path.name + ".part")
 
 
 def _export_payload(candidate, directory: Path) -> Path:
@@ -106,13 +111,24 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
     delay = float(config.get("delay", 1.0))
     headers = {"User-Agent": config.get("user_agent", "WebCSVExcelCollector/1.0")}
 
-    target: Path | None = None  # 本轮重试共用的目标路径（重传时复用同名）
+    final_target: Path | None = None  # 正式文件路径（首次成功响应后确定）
     last_error = ""
     for attempt in range(1, max_retries + 1):
         if delay > 0:
             time.sleep(delay)
+
+        # 已有断点进度：本次请求从断点继续
+        req_headers = dict(headers)
+        offset = 0
+        if final_target is not None:
+            part = _part_of(final_target)
+            if part.exists() and part.stat().st_size > 0:
+                offset = part.stat().st_size
+                req_headers["Range"] = f"bytes={offset}-"
+
         try:
-            resp = requests.get(candidate.url, stream=True, timeout=timeout, headers=headers)
+            resp = requests.get(candidate.url, stream=True, timeout=timeout,
+                                headers=req_headers)
         except requests.exceptions.SSLError:
             last_error = "SSL 错误（证书校验失败）"
             logger.warning("下载 %s 第 %d/%d 次失败：SSL 错误", candidate.url, attempt, max_retries)
@@ -131,12 +147,34 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
             continue
 
         with resp:
-            if resp.status_code == 200:
-                if target is None:
-                    target = _build_target_path(directory, candidate, resp)
+            if resp.status_code in (200, 206):
+                if final_target is None:
+                    final_target = _build_target_path(directory, candidate, resp)
+                part = _part_of(final_target)
+
+                if resp.status_code == 206:
+                    # 断点续传：Content-Range 形如 "bytes 100-999/1000"
+                    cr = resp.headers.get("Content-Range", "")
+                    tail = cr.rsplit("/", 1)[-1] if "/" in cr else ""
+                    total = int(tail) if tail.isdigit() else 0
+                    mode = "ab"  # 追加
+                else:
+                    # 服务器不支持 Range 或资源已变化：从头下载
+                    offset = 0
+                    cl = resp.headers.get("Content-Length", "")
+                    total = int(cl) if cl.isdigit() else 0
+                    mode = "wb"
+
                 try:
-                    _write_stream(resp, target)
-                    return True, "成功", target
+                    _write_stream(resp, part, mode, offset, total or None)
+                    done = part.stat().st_size if part.exists() else 0
+                    if not total or done >= total:
+                        part.replace(final_target)
+                        return True, "成功", final_target
+                    last_error = f"传输中断（{done}/{total} 字节）"
+                    logger.warning("下载 %s 提前结束（%s/%s 字节），将从断点续传……",
+                                   candidate.url, done, total)
+                    continue
                 except PermissionError as e:
                     # 明确的写盘权限错误：重试无意义，直接失败并提示
                     last_error = f"文件写入失败（权限问题）：{e}"
@@ -144,16 +182,11 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
                     return False, last_error, None
                 except (requests.exceptions.RequestException,
                         ConnectionError, OSError) as e:
-                    # 传输中断（连接重置 / SSL 提前结束 / 响应不完整等）：
-                    # 删除半截文件后重试（重新发起完整请求）
+                    # 传输中断：保留 .part 断点，下次带 Range 续传
+                    done = part.stat().st_size if part.exists() else 0
                     last_error = f"传输中断：{e}"
-                    logger.warning("下载 %s 传输中断：%s（将重试）",
-                                   candidate.url, e.__class__.__name__)
-                    try:
-                        target.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    target = None
+                    logger.warning("下载 %s 传输中断（已保留 %s 字节断点，将续传）：%s",
+                                   candidate.url, done, e.__class__.__name__)
                     continue
             elif 400 <= resp.status_code < 500 and resp.status_code != 429:
                 # 403/404 等客户端错误：不绕过、不重试，直接失败
@@ -165,6 +198,8 @@ def download_one(candidate, directory: Path, config: dict) -> tuple[bool, str, P
                 logger.warning("下载 %s 第 %d/%d 次失败：HTTP %d",
                                candidate.url, attempt, max_retries, resp.status_code)
 
+    if final_target is not None and _part_of(final_target).exists():
+        last_error += f"；断点已保存在 {_part_of(final_target).name}，重新运行可续传"
     return False, last_error or "未知错误", None
 
 
